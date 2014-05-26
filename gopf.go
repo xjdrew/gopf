@@ -159,6 +159,8 @@ func handleClient(pf* PF, source *net.TCPConn) {
     
     source.SetKeepAlive(true)
     source.SetKeepAlivePeriod(time.Second * 60)
+    source.SetLinger(-1)
+    dest.SetLinger(-1)
 
     go forward(source, dest)
     forward(dest, source)
