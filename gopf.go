@@ -6,90 +6,75 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-	"log"
-	"log/syslog"
-
 	"encoding/json"
+	"flag"
+	"io"
+	"log"
 	"math/rand"
+	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
-
-	"net"
-	"sync"
-	"sync/atomic"
 )
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [config]\n", os.Args[0])
-	flag.PrintDefaults()
-	os.Exit(1)
-}
+/*
+import "net/http"
+import _ "net/http/pprof"
+*/
 
 type Host struct {
 	Addr   string
 	Weight int
-
-	addr *net.TCPAddr
 }
 
-type Settings struct {
+type Backend struct {
 	Hosts  []Host
 	weight int
 }
 
-type Status struct {
-	actives int32
+type Options struct {
+	config  string
+	backend Backend
 }
 
-type PF struct {
-	// host list
-	config_file string
-	settings    *Settings
-
-	// listen port
-	localAddr string
-
-	// listen port
-	ln     *net.TCPListener
-	wg     sync.WaitGroup
-	status Status
+type Daemon struct {
+	downloadChan chan int64
+	uploadChan   chan int64
 }
 
-var pf PF
-var logger *log.Logger
+var options Options
+var daemon Daemon
 
-func readSettings(config_file string) *Settings {
-	fp, err := os.Open(config_file)
+func usage() {
+	log.Printf("usage: %s config\n", os.Args[0])
+	flag.PrintDefaults()
+	os.Exit(1)
+}
+
+func reloadConfig() error {
+	fp, err := os.Open(options.config)
 	if err != nil {
-		logger.Printf("open config file failed:%s", err.Error())
-		return nil
+		return err
 	}
 	defer fp.Close()
 
-	var settings Settings
+	var backend Backend
 	dec := json.NewDecoder(fp)
-	err = dec.Decode(&settings)
+	err = dec.Decode(&backend)
 	if err != nil {
-		logger.Printf("decode config file failed:%s", err.Error())
-		return nil
+		return err
 	}
 
-	for i := range settings.Hosts {
-		host := &settings.Hosts[i]
-		host.addr, err = net.ResolveTCPAddr("tcp", host.Addr)
-		if err != nil {
-			logger.Printf("resolve local addr failed:%s", err.Error())
-			return nil
-		}
-		settings.weight += host.Weight
+	for i := range backend.Hosts {
+		host := &backend.Hosts[i]
+		backend.weight += host.Weight
 	}
 
-	logger.Printf("config:%v", settings)
-	return &settings
+	log.Printf("config:%v", backend)
+	options.backend = backend
+	return nil
 }
 
 func chooseHost(weight int, hosts []Host) *Host {
@@ -107,121 +92,57 @@ func chooseHost(weight int, hosts []Host) *Host {
 	return nil
 }
 
-func forward(source *net.TCPConn, dest *net.TCPConn) {
+func forward(source *net.TCPConn, dest *net.TCPConn, c chan int64) {
 	defer func() {
-		dest.Close()
+		dest.CloseWrite()
+		source.CloseRead()
 	}()
 
-	bufsz := 1 << 12
-	cache := make([]byte, bufsz)
-	for {
-		// pump from source
-		n, err1 := source.Read(cache)
-
-		// pour into dest
-		c := 0
-		var err2 error
-		for c < n {
-			i, err2 := dest.Write(cache[c:n])
-			if err2 != nil {
-				break
-			}
-			c += i
-		}
-
-		if err1 != nil || err2 != nil {
-			break
-		}
-	}
+	n, _ := io.Copy(dest, source)
+	c <- n
 }
 
-func handleClient(pf *PF, source *net.TCPConn) {
-	atomic.AddInt32(&pf.status.actives, 1)
-	defer func() {
-		atomic.AddInt32(&pf.status.actives, -1)
-		pf.wg.Done()
-	}()
-
-	settings := pf.settings
-	host := chooseHost(settings.weight, settings.Hosts)
+func handleConn(source *net.TCPConn) {
+	host := chooseHost(options.backend.weight, options.backend.Hosts)
 	if host == nil {
 		source.Close()
-		logger.Println("choose host failed")
+		log.Println("choose host failed")
 		return
 	}
 
-	dest, err := net.DialTCP("tcp", nil, host.addr)
+	dest, err := net.Dial("tcp", host.Addr)
 	if err != nil {
 		source.Close()
-		logger.Printf("connect to %s failed: %s", host.addr, err.Error())
+		log.Printf("connect to %s failed: %s", host.Addr, err.Error())
 		return
 	}
 
 	source.SetKeepAlive(true)
 	source.SetKeepAlivePeriod(time.Second * 60)
-	source.SetLinger(-1)
-	dest.SetLinger(-1)
 
-	go forward(source, dest)
-	forward(dest, source)
-	//logger.Printf("forward finished, %v -> %v", source.RemoteAddr(), host)
-}
-
-func start(pf *PF) {
-	pf.wg.Add(1)
-	defer func() {
-		pf.wg.Done()
-	}()
-
-	laddr, err := net.ResolveTCPAddr("tcp", pf.localAddr)
-	if err != nil {
-		logger.Printf("resolve local addr failed:%s", err.Error())
-		return
-	}
-
-	ln, err := net.ListenTCP("tcp", laddr)
-	if err != nil {
-		logger.Printf("build listener failed:%s", err.Error())
-		return
-	}
-
-	pf.ln = ln
-	for {
-		conn, err := pf.ln.AcceptTCP()
-		if err != nil {
-			logger.Printf("accept failed:%s", err.Error())
-			if opErr, ok := err.(*net.OpError); ok {
-				if !opErr.Temporary() {
-					break
-				}
-			}
-			continue
-		}
-		pf.wg.Add(1)
-		go handleClient(pf, conn)
-	}
+	go forward(source, dest.(*net.TCPConn), daemon.uploadChan)
+	forward(dest.(*net.TCPConn), source, daemon.downloadChan)
 }
 
 const SIG_RELOAD = syscall.Signal(34)
 const SIG_STATUS = syscall.Signal(35)
 
-func reload() {
-	settings := readSettings(pf.config_file)
-	if settings == nil {
-		logger.Println("reload failed")
-		return
-	}
-	pf.settings = settings
-	logger.Println("reload succeed")
+func status() {
+	log.Printf("num goroutines: %d", runtime.NumGoroutine())
 }
 
-func status() {
-	logger.Printf("status: actives-> %d", pf.status.actives)
+func reload() {
+	err := reloadConfig()
+	if err != nil {
+		log.Printf("reload failed:%v", err)
+	} else {
+		log.Printf("reload succeed")
+	}
 }
 
 func handleSignal() {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, SIG_RELOAD, SIG_STATUS, syscall.SIGTERM)
+	signal.Notify(c, SIG_RELOAD, SIG_STATUS, syscall.SIGTERM, syscall.SIGHUP)
 
 	for sig := range c {
 		switch sig {
@@ -229,46 +150,97 @@ func handleSignal() {
 			reload()
 		case SIG_STATUS:
 			status()
-		case syscall.SIGTERM:
-			logger.Println("catch sigterm, ignore")
+		default:
+			log.Printf("catch siginal: %v, ignored", sig)
 		}
 	}
 }
 
-func init() {
-	var err error
-	logger, err = syslog.NewLogger(syslog.LOG_LOCAL0, 0)
-	if err != nil {
-		fmt.Printf("create logger failed:%s", err.Error())
-		os.Exit(1)
+func updateStats(tag *string, amount int64) {
+	log.Printf("stats tag:%s, amount:%d", *tag, amount)
+}
+
+var uploadTag = "upload"
+var downloadTag = "download"
+
+func handleDaemon() {
+	var totalUpload, spanUpload int64
+	var totalDownload, spanDownload int64
+	for {
+		var upload int64
+		var download int64
+		select {
+		case upload = <-daemon.uploadChan:
+			totalUpload += upload
+			spanUpload += upload
+			if spanUpload > 10 {
+				updateStats(&uploadTag, spanUpload)
+				spanUpload = 0
+			}
+		case download = <-daemon.downloadChan:
+			totalDownload += download
+			spanDownload += download
+			if spanDownload > 10 {
+				updateStats(&downloadTag, spanDownload)
+				spanDownload = 0
+			}
+		}
 	}
-	logger.Println("are you lucky? go!")
+}
+
+func handlePprof() {
+	/*
+	   log.Println(http.ListenAndServe("localhost:6060", nil))
+	*/
+}
+
+func init() {
 	rand.Seed(time.Now().Unix())
 }
 
 func main() {
-	flag.StringVar(&pf.localAddr, "listen_addr", "0.0.0.0:1248", "local listen port(0.0.0.0:1248)")
+	var listen string
+	flag.StringVar(&listen, "listen", ":1248", "local listen port(0.0.0.0:1248)")
 	flag.Usage = usage
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 1 {
-		logger.Println("config file is missing.")
-		os.Exit(1)
+		log.Println("config file is missed.")
+		return
 	}
 
-	pf.config_file = args[0]
-	logger.Printf("config file is: %s", pf.config_file)
-
-	pf.settings = readSettings(pf.config_file)
-	if pf.settings == nil {
-		logger.Println("parse config failed")
-		os.Exit(1)
+	options.config = args[0]
+	if err := reloadConfig(); err != nil {
+		log.Printf("load config failed:%v", err)
+		return
 	}
-
+	go handlePprof()
 	go handleSignal()
 
 	// run
-	start(&pf)
-	pf.wg.Wait()
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		log.Printf("build listener failed:%s", err.Error())
+		return
+	}
+	defer ln.Close()
+
+	daemon.downloadChan = make(chan int64)
+	daemon.uploadChan = make(chan int64)
+	go handleDaemon()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("accept failed:%s", err.Error())
+			if opErr, ok := err.(*net.OpError); ok {
+				if !opErr.Temporary() {
+					break
+				}
+			}
+			continue
+		}
+		go handleConn(conn.(*net.TCPConn))
+	}
 }
