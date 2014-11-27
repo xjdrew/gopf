@@ -6,21 +6,23 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
 
 /*
-import "net/http"
 import _ "net/http/pprof"
 */
 
@@ -30,8 +32,9 @@ type Host struct {
 }
 
 type Backend struct {
-	Hosts  []Host
-	weight int
+	TrafficUrl string
+	Hosts      []Host
+	weight     int
 }
 
 type Options struct {
@@ -40,6 +43,7 @@ type Options struct {
 }
 
 type Daemon struct {
+	name         string
 	downloadChan chan int64
 	uploadChan   chan int64
 }
@@ -156,16 +160,50 @@ func handleSignal() {
 	}
 }
 
-func updateStats(tag *string, amount int64) {
-	log.Printf("stats tag:%s, amount:%d", *tag, amount)
-}
-
 var uploadTag = "upload"
 var downloadTag = "download"
+var uploadStats map[string]interface{}
+var downloadStats map[string]interface{}
+
+func initStats() {
+	uploadStats = make(map[string]interface{})
+	uploadStats["name"] = daemon.name
+
+	downloadStats = make(map[string]interface{})
+	downloadStats["name"] = daemon.name
+}
+
+func updateStats(tag string, amount int64) {
+	log.Printf("stats tag:%s, amount:%d", tag, amount)
+	trafficUrl := options.backend.TrafficUrl
+	if trafficUrl == "" {
+		return
+	}
+
+	var v interface{}
+	if tag == uploadTag {
+		uploadStats[tag] = amount
+		v = uploadStats
+	} else {
+		downloadStats[tag] = amount
+		v = downloadStats
+	}
+	chunk, _ := json.Marshal(v)
+	reader := bytes.NewReader(chunk)
+	resp, err := http.Post(trafficUrl, "application/json", reader)
+	if err != nil {
+		log.Printf("post traffic stats failed:%s", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+}
 
 func handleDaemon() {
 	var totalUpload, spanUpload int64
 	var totalDownload, spanDownload int64
+
+	initStats()
+
 	for {
 		var upload int64
 		var download int64
@@ -174,14 +212,14 @@ func handleDaemon() {
 			totalUpload += upload
 			spanUpload += upload
 			if spanUpload > 10 {
-				updateStats(&uploadTag, spanUpload)
+				updateStats(uploadTag, spanUpload)
 				spanUpload = 0
 			}
 		case download = <-daemon.downloadChan:
 			totalDownload += download
 			spanDownload += download
 			if spanDownload > 10 {
-				updateStats(&downloadTag, spanDownload)
+				updateStats(downloadTag, spanDownload)
 				spanDownload = 0
 			}
 		}
@@ -200,7 +238,9 @@ func init() {
 
 func main() {
 	var listen string
+	var name string
 	flag.StringVar(&listen, "listen", ":1248", "local listen port(0.0.0.0:1248)")
+	flag.StringVar(&name, "name", "", "access point name(\"\")")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -226,6 +266,11 @@ func main() {
 	}
 	defer ln.Close()
 
+	if name == "" {
+		pos := strings.LastIndex(listen, ":")
+		name = listen[pos+1:]
+	}
+	daemon.name = name
 	daemon.downloadChan = make(chan int64)
 	daemon.uploadChan = make(chan int64)
 	go handleDaemon()
