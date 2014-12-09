@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
-	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -44,12 +43,13 @@ type Options struct {
 
 type Daemon struct {
 	name         string
-	downloadChan chan int64
-	uploadChan   chan int64
+	downloadChan chan uint64
+	uploadChan   chan uint64
 }
 
 var options Options
 var daemon Daemon
+var mpool *MPool
 
 func usage() {
 	log.Printf("usage: %s config\n", os.Args[0])
@@ -96,14 +96,24 @@ func chooseHost(weight int, hosts []Host) *Host {
 	return nil
 }
 
-func forward(source *net.TCPConn, dest *net.TCPConn, c chan int64) {
-	defer func() {
-		dest.CloseWrite()
-		source.CloseRead()
-	}()
+func forward(source *net.TCPConn, dest *net.TCPConn, c chan uint64) {
+	defer dest.CloseWrite()
+	defer source.CloseRead()
 
-	n, _ := io.Copy(dest, source)
-	c <- n
+	var written uint64
+	buf := mpool.Get()
+	for {
+		n, err := source.Read(buf)
+		if err != nil {
+			break
+		}
+		written += uint64(n)
+		_, err = dest.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+	c <- written
 }
 
 func handleConn(source *net.TCPConn) {
@@ -128,11 +138,14 @@ func handleConn(source *net.TCPConn) {
 	forward(dest.(*net.TCPConn), source, daemon.downloadChan)
 }
 
-const SIG_RELOAD = syscall.Signal(34)
-const SIG_STATUS = syscall.Signal(35)
+const SIG_RELOAD = syscall.Signal(35)
+const SIG_STATUS = syscall.Signal(36)
 
 func status() {
 	log.Printf("num goroutines: %d", runtime.NumGoroutine())
+	buf := make([]byte, 32768)
+	runtime.Stack(buf, true)
+	log.Printf("!!!!!stack!!!!!:%s", buf)
 }
 
 func reload() {
@@ -164,6 +177,7 @@ var uploadTag = "upload"
 var downloadTag = "download"
 var uploadStats map[string]interface{}
 var downloadStats map[string]interface{}
+var updateThreshold uint64 = 1048576
 
 func initStats() {
 	uploadStats = make(map[string]interface{})
@@ -173,8 +187,7 @@ func initStats() {
 	downloadStats["name"] = daemon.name
 }
 
-func updateStats(tag string, amount int64) {
-	log.Printf("stats tag:%s, amount:%d", tag, amount)
+func updateStats(tag string, amount uint64) {
 	trafficUrl := options.backend.TrafficUrl
 	if trafficUrl == "" {
 		return
@@ -195,30 +208,35 @@ func updateStats(tag string, amount int64) {
 		log.Printf("post traffic stats failed:%s", err.Error())
 		return
 	}
-	defer resp.Body.Close()
+	resp.Body.Close()
 }
 
 func handleDaemon() {
-	var totalUpload, spanUpload int64
-	var totalDownload, spanDownload int64
-
 	initStats()
 
+	var spanUpload, spanDownload uint64
 	for {
-		var upload int64
-		var download int64
+		var upload uint64
+		var download uint64
 		select {
 		case upload = <-daemon.uploadChan:
-			totalUpload += upload
 			spanUpload += upload
-			if spanUpload > 10 {
+			if spanUpload > updateThreshold {
 				updateStats(uploadTag, spanUpload)
 				spanUpload = 0
 			}
 		case download = <-daemon.downloadChan:
-			totalDownload += download
 			spanDownload += download
-			if spanDownload > 10 {
+			if spanDownload > updateThreshold {
+				updateStats(downloadTag, spanDownload)
+				spanDownload = 0
+			}
+		case <-time.After(60 * time.Second):
+			if spanUpload > 0 {
+				updateStats(uploadTag, spanUpload)
+				spanUpload = 0
+			}
+			if spanDownload > 0 {
 				updateStats(downloadTag, spanDownload)
 				spanDownload = 0
 			}
@@ -234,6 +252,7 @@ func handlePprof() {
 
 func init() {
 	rand.Seed(time.Now().Unix())
+	mpool = NewMPool(4096)
 }
 
 func main() {
@@ -271,8 +290,8 @@ func main() {
 		name = listen[pos+1:]
 	}
 	daemon.name = name
-	daemon.downloadChan = make(chan int64)
-	daemon.uploadChan = make(chan int64)
+	daemon.downloadChan = make(chan uint64, 1024)
+	daemon.uploadChan = make(chan uint64, 1024)
 	go handleDaemon()
 
 	for {
