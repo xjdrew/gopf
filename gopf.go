@@ -258,7 +258,7 @@ func init() {
 func main() {
 	var listen string
 	var name string
-	flag.StringVar(&listen, "listen", ":1248", "local listen port(0.0.0.0:1248)")
+	flag.StringVar(&listen, "listen", ":1248", "local listen port")
 	flag.StringVar(&name, "name", "", "access point name(\"\")")
 	flag.Usage = usage
 	flag.Parse()
