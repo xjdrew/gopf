@@ -129,22 +129,6 @@ func reload() {
 	}
 }
 
-func handleSignal() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, SIG_RELOAD, SIG_STATUS, syscall.SIGTERM, syscall.SIGHUP)
-
-	for sig := range c {
-		switch sig {
-		case SIG_RELOAD:
-			reload()
-		case SIG_STATUS:
-			status()
-		default:
-			log.Printf("catch siginal: %v, ignored", sig)
-		}
-	}
-}
-
 func init() {
 	rand.Seed(time.Now().Unix())
 }
@@ -166,7 +150,6 @@ func main() {
 		log.Printf("load config failed:%v", err)
 		return
 	}
-	go handleSignal()
 
 	// run
 	ln, err := net.Listen("tcp", laddr)
@@ -176,6 +159,23 @@ func main() {
 	}
 	defer ln.Close()
 
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, SIG_RELOAD, SIG_STATUS, syscall.SIGTERM, syscall.SIGHUP)
+
+		for sig := range c {
+			switch sig {
+			case SIG_RELOAD:
+				reload()
+			case SIG_STATUS:
+				status()
+			default:
+				log.Printf("catch siginal: %v, ignored", sig)
+			}
+		}
+	}()
+
+	// run loop
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
