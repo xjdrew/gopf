@@ -65,4 +65,4 @@ WARNING: The median and mean for the processing time are not within a normal dev
         These results are probably not that reliable.
 ```
 
-* very fast than pen(http://siag.nu/pen/)
+* much faster than pen(http://siag.nu/pen/)
